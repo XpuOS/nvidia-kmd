@@ -534,6 +534,8 @@ struct uvm_va_block_struct
         // Storage node for range tree of va_blocks.
         uvm_range_tree_node_t node;
     } hmm;
+
+    atomic64_t last_fault_timestamp;
 };
 
 // We define additional per-VA Block fields for testing. When

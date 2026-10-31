@@ -25,6 +25,10 @@ include utils.mk
 .PHONY: all
 all: modules
 
+.PHONY: msched
+msched: modules modules_install
+	sudo rmmod nvidia_uvm; sudo insmod ./kernel-open/nvidia-uvm.ko
+
 ###########################################################################
 # nv-kernel.o is the OS agnostic portion of nvidia.ko
 ###########################################################################

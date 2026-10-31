@@ -1313,6 +1313,8 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
 
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
 
+    atomic64_set(&block->last_fault_timestamp, 0);
+    
     *out_block = block;
     return NV_OK;
 
@@ -12465,6 +12467,12 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
         if (status != NV_OK)
             break;
 
+        if(!UVM_ID_IS_CPU(processor_id) &&
+            (service_context->operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS ||
+            service_context->operation == UVM_SERVICE_OPERATION_NON_REPLAYABLE_FAULTS)) {
+            atomic64_set(&va_block->last_fault_timestamp, NV_GETTIME());
+        }
+
         status = uvm_va_block_service_finish(processor_id, va_block, service_context);
         if (status != NV_OK)
             break;
@@ -14174,4 +14182,216 @@ out:
 void uvm_va_block_mark_cpu_dirty(uvm_va_block_t *va_block)
 {
     block_mark_region_cpu_dirty(va_block, uvm_va_block_region_from_block(va_block));
+}
+
+NV_STATUS uvm_api_hint(UVM_HINT_PARAMS *params, struct file *filp) {
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_t *dest_gpu = NULL;
+    NvU64 base = params->base, length = params->length;
+    NV_STATUS status = NV_OK;
+    params->unloaded_chunks = 0;
+    NvU64 count = -1;
+    uvm_va_space_down_read(va_space);
+
+    if (uvm_uuid_is_cpu(&params->destinationUuid)) {
+        goto done;
+    }
+
+    dest_gpu = uvm_va_space_get_gpu_by_uuid_with_gpu_va_space(va_space, &params->destinationUuid);
+    if (!dest_gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto done;
+    }
+
+    if (params->length > 0 && !uvm_gpu_can_address(dest_gpu, params->base, params->length)) {
+        status = NV_ERR_OUT_OF_RANGE;
+        goto done;
+    }
+
+    uvm_va_range_managed_t *first_managed_range = NULL;
+    
+    first_managed_range = uvm_va_space_iter_managed_first(va_space, base, base);
+    if (!first_managed_range) {
+        status = NV_ERR_INVALID_ADDRESS;
+        goto done;
+    }
+    
+    uvm_va_range_managed_t *managed_range;
+    NvU64 end = base + length - 1;
+    uvm_for_each_va_range_managed_in_contig_from(managed_range, first_managed_range, end) {
+        uvm_range_group_range_iter_t iter;
+        uvm_range_group_for_each_migratability_in(&iter,
+                                            va_space,
+                                            max(base, managed_range->va_range.node.start),
+                                            min(end, managed_range->va_range.node.end)) {
+            size_t i;
+            const size_t first_block_index = uvm_va_range_block_index(managed_range, iter.start);
+            const size_t last_block_index = uvm_va_range_block_index(managed_range, iter.end);
+            for (i = first_block_index; i <= last_block_index; i++) {
+                uvm_va_block_t *va_block;
+                status = uvm_va_range_block_create(managed_range, i, &va_block);
+                if (status != NV_OK) {
+                    goto done;
+                }
+                if (uvm_processor_mask_test(&va_block->resident, dest_gpu->id)) {
+                    block_mark_memory_used(va_block, dest_gpu->id);
+                    count += 1;
+                } else {
+                    params->unloaded_chunks += 1;
+                }
+            }
+        }
+    }
+    done:
+    // printk("unloaded chunks %lld loaded %lld", params->unloaded_chunks, count);
+    uvm_va_space_up_read(va_space);
+    return status;
+}
+
+NV_STATUS uvm_api_get_current_ws(UVM_GET_CURRENT_WS_PARAMS *params, struct file *filp) {
+    NV_STATUS status = NV_OK;
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_t *gpu = NULL;
+    uvm_pmm_gpu_t *pmm = NULL;
+    uvm_gpu_chunk_t *chunk = NULL;
+    UVM_Interval *ws = NULL;
+    NvU64 ws_idx = -1;
+    ws = kcalloc(params->intervalCapacity, sizeof(UVM_Interval), GFP_KERNEL);
+    if (!ws) {
+        status = NV_ERR_NO_MEMORY;
+        goto done;
+    }
+
+    uvm_va_space_down_read(va_space);
+
+    uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+    for_each_gpu(gpu) {
+        pmm = &gpu->pmm;
+        uvm_spin_lock(&pmm->list_lock);
+        list_for_each_entry(chunk, &pmm->root_chunks.va_block_used, list) {
+            uvm_va_block_t *va_block = chunk->va_block;
+            if (!va_block) {
+                continue;
+            }
+            uvm_va_space_t *chunk_va_space = uvm_va_block_get_va_space(va_block);
+            if (!chunk_va_space || chunk_va_space != va_space) {
+                continue;
+            }
+            NvU64 start = va_block->start;
+            NvU64 end = va_block->end + 1;
+            if (ws_idx == -1) {
+                ws[0].start = start;
+                ws[0].end = end;
+                ws_idx = 0;
+            } else {
+                if (ws[ws_idx].end == start) {
+                    ws[ws_idx].end = end;
+                } else {
+                    ws_idx += 1;
+                    if (ws_idx >= params->intervalCapacity) {
+                        status = NV_ERR_MEMORY_ERROR;
+                        break;
+                    }
+                    ws[ws_idx].start = start;
+                    ws[ws_idx].end = end;
+                }
+            }
+        }
+        uvm_spin_unlock(&pmm->list_lock);
+    }
+    uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+    uvm_va_space_up_read(va_space);
+
+    params->intervalCount = ws_idx + 1;
+    int remaining = copy_to_user((void __user *)params->intervals, 
+                ws, sizeof(UVM_Interval) * params->intervalCount);
+    if (remaining) {
+        status = NV_ERR_INVALID_ADDRESS;
+    }
+
+done:
+    kfree(ws);
+    return status;
+}
+
+NV_STATUS uvm_api_query_pf(UVM_QUERY_PF_PARAMS *params, struct file *filp) {
+    NV_STATUS status = NV_OK;
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_t *gpu = NULL;
+    uvm_pmm_gpu_t *pmm = NULL;
+    uvm_gpu_chunk_t *chunk = NULL;
+    NvU64 range_count = 0;
+    bool buffer_full = false;
+    UVM_FAULT_INFO *ranges = NULL;
+    params->rangeCount = 0;
+
+    ranges = kcalloc(params->rangeCapacity, sizeof(UVM_FAULT_INFO), GFP_KERNEL);
+    if (!ranges) {
+        status = NV_ERR_NO_MEMORY;
+        goto done;
+    }
+
+    uvm_mutex_lock(&g_uvm_global.global_lock);
+    uvm_va_space_down_read(va_space);
+
+    // uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+    for_each_gpu(gpu) {
+        pmm = &gpu->pmm;
+        uvm_spin_lock(&pmm->list_lock);
+
+        list_for_each_entry(chunk, &pmm->root_chunks.va_block_used, list) {
+            uvm_va_block_t *va_block = chunk->va_block;
+            NvU64 start;
+            NvU64 end;
+
+            if (!va_block)
+                continue;
+
+            if (uvm_va_block_get_va_space(va_block) != va_space)
+                continue;
+
+            NvU64 timestamp = atomic64_read(&va_block->last_fault_timestamp);
+            if (timestamp == 0 ||
+                timestamp <= params->sinceTimestampNs)
+                continue;
+
+            start = va_block->start;
+            end = va_block->end + 1;
+
+            // if (range_count > 0 && ranges[range_count - 1].end == start) {
+            //     ranges[range_count - 1].end = end;
+            //     continue;
+            // }
+
+            if (range_count >= params->rangeCapacity) {
+                status = NV_ERR_BUFFER_TOO_SMALL;
+                buffer_full = true;
+                break;
+            }
+
+            ranges[range_count].start = start;
+            ranges[range_count].end = end;
+            ranges[range_count].timestamp = timestamp;
+            ++range_count;
+        }
+
+        uvm_spin_unlock(&pmm->list_lock);
+
+        if (buffer_full)
+            break;
+    }
+    // uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+    uvm_va_space_up_read(va_space);
+    uvm_mutex_unlock(&g_uvm_global.global_lock);
+
+    params->rangeCount = range_count;
+    int remaining = copy_to_user((void __user *)NvP64_VALUE(params->faultRanges), 
+                ranges, sizeof(UVM_FAULT_INFO) * params->rangeCount);
+    if (remaining) {
+        status = NV_ERR_INVALID_ADDRESS;
+    }
+
+done:
+    kfree(ranges);
+    return status;
 }

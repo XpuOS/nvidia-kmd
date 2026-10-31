@@ -1134,6 +1134,56 @@ typedef struct
 } UVM_DISCARD_PARAMS;
 
 //
+// UvmGetCurrentWS
+//
+#define UVM_GET_CURRENT_WS                                            UVM_IOCTL_BASE(1999)
+typedef struct {
+    NvU64 start;
+    NvU64 end;
+} UVM_Interval;
+
+typedef struct
+{
+    NvU64 intervalCapacity;    // IN
+    NvU64 intervalCount;       // OUT
+    UVM_Interval *intervals;   // IN/OUT
+    NV_STATUS rmStatus;        // OUT
+} UVM_GET_CURRENT_WS_PARAMS;
+
+//
+// UvmQueryPF
+//
+#define UVM_QUERY_PF                                                    UVM_IOCTL_BASE(2000)
+typedef struct {
+    NvU64 start;
+    NvU64 end;
+    NvU64 timestamp;
+} UVM_FAULT_INFO;
+typedef struct
+{
+    NvU64 sinceTimestampNs NV_ALIGN_BYTES(8);    // IN
+    NvU64 rangeCapacity NV_ALIGN_BYTES(8);    // IN
+    NvU64 rangeCount NV_ALIGN_BYTES(8);       // OUT
+    NvP64 faultRanges NV_ALIGN_BYTES(8);   // IN/OUT UVM_Interval*
+    NV_STATUS rmStatus;        // OUT
+} UVM_QUERY_PF_PARAMS;
+
+//
+// UvmHint
+//
+#define UVM_HINT                                                    UVM_IOCTL_BASE(2046)
+#define UVM_HINT_FLAG_WILL_ACCESSED_BY  0x1 // will be accessed by destinationUUID
+typedef struct
+{
+
+    NvU64           base               NV_ALIGN_BYTES(8); // IN
+    NvU64           length             NV_ALIGN_BYTES(8); // IN
+    NvProcessorUuid destinationUuid;                      // IN
+    NvU64           unloaded_chunks;                      // OUT
+    NV_STATUS       rmStatus;                             // OUT
+} UVM_HINT_PARAMS;
+
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.

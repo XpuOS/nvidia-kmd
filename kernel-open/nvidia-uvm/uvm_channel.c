@@ -3124,6 +3124,7 @@ static void pick_ces(uvm_channel_manager_t *manager, const UvmGpuCopyEngineCaps 
     UVM_ASSERT(!g_uvm_global.conf_computing_enabled);
 
     pick_ces_for_channel_types(manager, ce_caps, types, ARRAY_SIZE(types), preferred_ce);
+    preferred_ce[UVM_CHANNEL_TYPE_MEMOPS] = preferred_ce[UVM_CHANNEL_TYPE_GPU_TO_CPU];
 }
 
 static void pick_ces_conf_computing(uvm_channel_manager_t *manager,
